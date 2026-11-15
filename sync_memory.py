@@ -12,6 +12,7 @@
 import glob
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.request
@@ -21,6 +22,23 @@ URL = "https://api.z.ai/api/paas/v4/chat/completions"
 STATE_FILE = "sync-state.json"
 FACTS_FILE = "facts.json"
 FULL = "--full" in sys.argv
+MARK = "--mark" in sys.argv
+
+# всё, что похоже на ключ/токен, вырезаем ДО отправки куда-либо
+SECRET_PATTERNS = [
+    re.compile(r"[a-f0-9]{32}\.[A-Za-z0-9]{8,}"),        # ключ Z.ai
+    re.compile(r"\b\d{8,12}:[A-Za-z0-9_-]{30,}"),         # токен бота Telegram
+    re.compile(r"\b(?:ghp|gho|github_pat)_[A-Za-z0-9_]{20,}"),  # GitHub
+    re.compile(r"\b(?:sk|rk)-[A-Za-z0-9_-]{20,}"),        # OpenAI-подобные
+    re.compile(r"\b[a-f0-9]{40,}\b"),                     # длинный hex
+    re.compile(r"db2375b458e4415cb2e9156d41da44b4"),      # известный префикс
+]
+
+
+def redact(s):
+    for p in SECRET_PATTERNS:
+        s = p.sub("[СЕКРЕТ]", s)
+    return s
 
 
 def find_key():
@@ -77,10 +95,20 @@ def main():
             continue
         title = d.get("meta", {}).get("title", "?")[:60]
         block = f"\n=== ЧАТ: {title} ===\n" + "\n".join(
-            f"{m.get('role','?')}: {str(m.get('content',''))[:500]}" for m in new
+            f"{m.get('role','?')}: {redact(str(m.get('content',''))[:500])}" for m in new
             if str(m.get("content", "")).strip())
         if len(block) > 80:
             blocks.append(block)
+
+    if MARK:
+        # только отметить обработанное, ничего не анализировать
+        json.dump({"files": processed}, open(STATE_FILE, "w", encoding="utf-8"), ensure_ascii=False)
+        git("add", STATE_FILE)
+        git("commit", "-m", "sync: отметка обработанных чатов")
+        git("pull", "--rebase", "origin", "main")
+        git("push", "origin", "HEAD:main")
+        print("Базовая отметка записана и залита.")
+        return
 
     print(f"Новых сообщений нет." if not blocks else f"Чатов с новым: {len(blocks)}")
     if not blocks:
@@ -97,9 +125,7 @@ def main():
     new_facts = []
     for i, b in enumerate(blocks):
         print(f"анализ {i + 1}/{len(blocks)}...")
-        cur = "\n".join(b)
-        if len(cur) > 25000:
-            cur = cur[:25000]
+        cur = b if len(b) <= 25000 else b[:25000]
         try:
             new_facts.append(glm(
                 "Ниже свежие сообщения пользователя из его чатов с ассистентом. Выдели долговременные факты "

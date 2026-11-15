@@ -13,11 +13,27 @@
 import base64
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 import urllib.parse
 import urllib.request
+
+# секреты (ключи, токены) не должны утекать в публичный memory.json
+SECRET_PATTERNS = [
+    re.compile(r"[a-f0-9]{32}\.[A-Za-z0-9]{8,}"),
+    re.compile(r"\b\d{8,12}:[A-Za-z0-9_-]{30,}"),
+    re.compile(r"\b(?:ghp|gho|github_pat)_[A-Za-z0-9_]{20,}"),
+    re.compile(r"\b(?:sk|rk)-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"\b[a-f0-9]{40,}\b"),
+]
+
+
+def redact(s):
+    for p in SECRET_PATTERNS:
+        s = p.sub("[СЕКРЕТ]", s)
+    return s
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ZAI_API_KEY = os.environ["ZAI_API_KEY"]
@@ -265,7 +281,7 @@ def handle_message(msg):
         return
 
     hist = histories.setdefault(chat_id, [])
-    hist.append({"role": "user", "content": text if text else "Что на картинке?"})
+    hist.append({"role": "user", "content": redact(text if text else "Что на картинке?")})
 
     try:
         tg_call("sendChatAction", {"chat_id": chat_id, "action": "typing"})
@@ -285,13 +301,12 @@ def handle_message(msg):
             answer = glm_call(VISION_MODEL, [vision_msg])
             hist[-1] = {"role": "user",
                         "content": ("[фото + текст] " if text else "[фото] ") + (text or "")}
-            hist.append({"role": "assistant", "content": answer[:500]})
+            answer = answer[:500]
         else:
             answer = glm_call(TEXT_MODEL, [build_system(chat_id)] + hist)
-            hist.append({"role": "assistant", "content": answer})
     except Exception as e:
         answer = f"⚠️ Ошибка обращения к Z.ai: {e}"
-        hist.append({"role": "assistant", "content": answer})
+    hist.append({"role": "assistant", "content": redact(answer)})
 
     del hist[:-HISTORY_LIMIT]
 
