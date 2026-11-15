@@ -99,6 +99,25 @@ def is_allowed(user_id):
     return user_id == OWNER_ID or user_id in trusted
 
 
+def refresh_external_state():
+    """Подтягивает факты/доверенных, залитые с других устройств (git pull)."""
+    try:
+        m0 = os.path.getmtime(FACTS_FILE) if os.path.exists(FACTS_FILE) else 0
+        r = subprocess.run(["git", "pull", "--rebase", "origin", "main"],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            print("git pull:", (r.stderr or r.stdout).strip()[:120], flush=True)
+            return
+        m1 = os.path.getmtime(FACTS_FILE) if os.path.exists(FACTS_FILE) else 0
+        if m1 != m0:
+            global facts, trusted
+            facts = {int(k): v for k, v in _load_json(FACTS_FILE, {}).items()}
+            trusted = set(_load_json(TRUSTED_FILE, []))
+            print("Память обновлена из репозитория (синхронизация с устройствами)", flush=True)
+    except Exception as e:
+        print("refresh не удался:", e, flush=True)
+
+
 # ---------- телеграм ----------
 def tg_call(method, params=None, timeout=60):
     req = urllib.request.Request(
@@ -313,8 +332,13 @@ def main():
         print("Не удалось установить меню команд:", e, flush=True)
 
     offset = None
+    last_refresh = time.time()
     while True:
         try:
+            if time.time() - last_refresh > 600:  # раз в 10 минут
+                last_refresh = time.time()
+                refresh_external_state()
+
             params = {"timeout": 25}
             if offset is not None:
                 params["offset"] = offset
