@@ -1,0 +1,25 @@
+name: boris
+
+on:
+  schedule:
+    - cron: "0 */5 * * *"   # перезапуск каждые 5 часов (лимит job — 6 ч)
+  workflow_dispatch:        # возможность запустить руками
+
+concurrency:
+  group: boris-bot
+  cancel-in-progress: false # два бота одновременно = конфликт 409 в Telegram
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 290    # завершаем чуть раньше расписания, без наложения
+    env:
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run bot
+        run: python bot.py
