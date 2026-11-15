@@ -297,6 +297,21 @@ def main():
     load_state()
     tg_call("deleteWebhook", {"drop_pending_updates": False})
 
+    # правильное меню команд вместо старого от ZCode
+    try:
+        tg_call("setMyCommands", {"commands": [
+            {"command": "start", "description": "Приветствие"},
+            {"command": "id", "description": "Показать свой Telegram id"},
+            {"command": "list", "description": "Список доверенных людей"},
+            {"command": "allow", "description": "(хозяин) добавить доверенного: /allow <id>"},
+            {"command": "disallow", "description": "(хозяин) убрать доверенного: /disallow <id>"},
+            {"command": "facts", "description": "Что я о тебе запомнил (долгая память)"},
+            {"command": "clear", "description": "Очистить рабочую память чата"},
+        ]})
+        print("Меню команд установлено.", flush=True)
+    except Exception as e:
+        print("Не удалось установить меню команд:", e, flush=True)
+
     offset = None
     while True:
         try:
