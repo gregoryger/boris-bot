@@ -5,6 +5,9 @@ on:
     - cron: "0 */5 * * *"   # перезапуск каждые 5 часов (лимит job — 6 ч)
   workflow_dispatch:        # возможность запустить руками
 
+permissions:
+  contents: write           # бот коммитит memory.json (постоянная память)
+
 concurrency:
   group: boris-bot
   cancel-in-progress: false # два бота одновременно = конфликт 409 в Telegram
@@ -12,7 +15,7 @@ concurrency:
 jobs:
   bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 290    # завершаем чуть раньше расписания, без наложения
+    timeout-minutes: 290
     env:
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
       ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
@@ -21,5 +24,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Git identity (для коммитов памяти)
+        run: |
+          git config user.name "boris-bot"
+          git config user.email "boris-bot@users.noreply.github.com"
       - name: Run bot
         run: python bot.py
