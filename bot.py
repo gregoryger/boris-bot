@@ -56,7 +56,11 @@ FACTS_MAX_CHARS = 6000      # потолок списка фактов
 SYSTEM_PROMPT = (
     "Ты — Борис, дружелюбный и полезный ассистент в Telegram твоего хозяина. "
     "Отвечай на языке пользователя, чаще по-русски. Пиши кратко и по делу, "
-    "без лишних извинений и воды."
+    "без лишних извинений и воды. Ты не можешь выполнять код и запускать программы — "
+    "никогда не притворяйся, что сделал это. Если пользователь просит подготовить документ (docx), "
+    "выдай его содержимое в блоке ```doc: первая строка — заголовок документа, дальше абзацы обычным текстом, "
+    "строка с '# ' — подзаголовок, '- ' — пункт списка. Вне этого блока напиши 1-2 предложения о документе. "
+    "Во всех остальных случаях, если чего-то не можешь — честно скажи."
 )
 
 histories = {}  # chat_id -> [{"role":..., "content":...}]
@@ -302,6 +306,44 @@ def handle_search(chat_id, hist, query):
     print(f"search done chat {chat_id}", flush=True)
 
 
+# ---------- генерация и отправка файлов ----------
+def build_docx(content):
+    from docx import Document
+    lines = [l.strip() for l in content.splitlines() if l.strip()]
+    if not lines:
+        return None
+    doc = Document()
+    doc.add_heading(lines[0].lstrip("# ") or "Документ", level=1)
+    for l in lines[1:]:
+        if l.startswith("#"):
+            doc.add_heading(l.lstrip("# "), level=2)
+        elif l.startswith(("- ", "* ", "• ")):
+            doc.add_paragraph(l.lstrip("-*• "), style="List Bullet")
+        elif re.match(r"^\d+[\.\)]\s", l):
+            doc.add_paragraph(re.sub(r"^\d+[\.\)]\s", "", l), style="List Number")
+        else:
+            doc.add_paragraph(l)
+    path = "/tmp/boris_doc.docx"
+    doc.save(path)
+    return path
+
+
+def send_document(chat_id, path, filename):
+    boundary = "----borisdoc987654321"
+    with open(path, "rb") as f:
+        data = f.read()
+    body = (
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n"
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{filename}\"\r\n"
+        f"Content-Type: application/vnd.openxmlformats-officedocument.wordprocessingml.document\r\n\r\n"
+    ).encode("utf-8") + data + f"\r\n--{boundary}--\r\n".encode("utf-8")
+    req = urllib.request.Request(
+        TG + "/sendDocument", data=body, method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    with urllib.request.urlopen(req, timeout=120):
+        pass
+
+
 def download_photo(file_id):
     info = tg_call("getFile", {"file_id": file_id})
     path = info["result"]["file_path"]
@@ -475,6 +517,16 @@ def handle_message(msg):
             answer = answer[:500]
         else:
             answer = glm_call(TEXT_MODEL, [build_system(chat_id)] + hist)
+            doc_block = re.search(r"```doc\s*\n(.*?)```", answer, re.S)
+            if doc_block:
+                answer = (answer[:doc_block.start()] + answer[doc_block.end():]).strip()
+                try:
+                    path = build_docx(doc_block.group(1))
+                    if path:
+                        send_document(chat_id, path, "boris.docx")
+                        answer = (answer + "\n\n📎 Файл boris.docx отправил!").strip()
+                except Exception as e:
+                    answer = (answer + f"\n\n⚠️ Не смог собрать файл: {e}").strip()
     except Exception as e:
         answer = f"⚠️ Ошибка обращения к Z.ai: {e}"
     hist.append({"role": "assistant", "content": redact(answer)})
