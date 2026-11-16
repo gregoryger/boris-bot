@@ -24,6 +24,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Зависимости для документов
+        run: pip install --quiet pypdf python-docx python-pptx openpyxl
       - name: Git identity (для коммитов памяти)
         run: |
           git config user.name "boris-bot"

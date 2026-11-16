@@ -11,6 +11,7 @@
 Секреты: TELEGRAM_TOKEN, ZAI_API_KEY.
 """
 import base64
+import html as html_mod
 import json
 import os
 import re
@@ -153,6 +154,154 @@ def send_message(chat_id, text):
             print("sendMessage error:", e, flush=True)
 
 
+# ---------- документы ----------
+DOC_EXTS = ("pdf", "docx", "pptx", "xlsx", "txt", "md", "csv", "log", "json", "html", "py")
+
+
+def extract_text(path, name):
+    ext = name.rsplit(".", 1)[-1].lower()
+    try:
+        if ext == "pdf":
+            from pypdf import PdfReader
+            r = PdfReader(path)
+            return "\n".join((p.extract_text() or "") for p in r.pages[:40])
+        if ext == "docx":
+            import docx
+            d = docx.Document(path)
+            return "\n".join(p.text for p in d.paragraphs)
+        if ext == "pptx":
+            from pptx import Presentation
+            pr = Presentation(path)
+            out = []
+            for i, s in enumerate(pr.slides, 1):
+                out.append(f"— слайд {i} —")
+                for sh in s.shapes:
+                    if sh.has_text_frame:
+                        out.append(sh.text_frame.text)
+            return "\n".join(out)
+        if ext == "xlsx":
+            import openpyxl
+            wb = openpyxl.load_workbook(path, read_only=True)
+            out = []
+            for ws in wb.worksheets[:5]:
+                out.append(f"— лист {ws.title} —")
+                for row in list(ws.iter_rows(values_only=True))[:200]:
+                    out.append(" | ".join("" if c is None else str(c) for c in row[:20]))
+            return "\n".join(out)
+        if ext in ("txt", "md", "csv", "log", "json", "html", "py"):
+            with open(path, encoding="utf-8", errors="ignore") as f:
+                return f.read()
+    except Exception as e:
+        return f"[ошибка извлечения: {e}]"
+    return ""
+
+
+def zai_file_qa(path, name, question):
+    """Фолбэк для сканов: файл уезжает в Z.ai, отвечает glm-4.6v."""
+    boundary = "----boris1234567890"
+    with open(path, "rb") as f:
+        data = f.read()
+    body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\nfile-extract\r\n"
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\n"
+            f"Content-Type: application/octet-stream\r\n\r\n").encode("utf-8") + data + f"\r\n--{boundary}--\r\n".encode("utf-8")
+    req = urllib.request.Request(ZAI_URL.rsplit("/chat", 1)[0] + "/files", data=body, method="POST",
+                                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}",
+                                          "Authorization": "Bearer " + ZAI_API_KEY})
+    with urllib.request.urlopen(req, timeout=300) as r:
+        fid = json.loads(r.read().decode("utf-8"))["id"]
+    return glm_call(VISION_MODEL, [{
+        "role": "user",
+        "content": [{"type": "file", "file": {"file_id": fid}},
+                    {"type": "text", "text": question}]}])
+
+
+def tg_download(file_id, name):
+    info = tg_call("getFile", {"file_id": file_id})
+    url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{info['result']['file_path']}"
+    path = os.path.join("/tmp", re.sub(r"[^\w.\-]", "_", name) or "file")
+    with urllib.request.urlopen(url, timeout=120) as r, open(path, "wb") as f:
+        f.write(r.read())
+    return path
+
+
+def handle_document(msg, chat_id, hist):
+    doc = msg["document"]
+    name = doc.get("file_name", "файл")
+    if doc.get("file_size", 0) > 20 * 1024 * 1024:
+        send_message(chat_id, "Файл больше 20 МБ — Telegram не даёт ботам скачать такой. Пришли поменьше 🙂")
+        return
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    if ext not in DOC_EXTS:
+        send_message(chat_id, "Поддерживаю: PDF, Word (docx), PowerPoint (pptx), Excel (xlsx), txt, md, csv, json, html, py.")
+        return
+
+    send_message(chat_id, f"📖 Читаю «{name}»...")
+    try:
+        path = tg_download(doc["file_id"], name)
+        text = extract_text(path, name)
+        if len(text.strip()) < 20 and ext == "pdf":
+            print("PDF без текстового слоя — пробую Z.ai extract", flush=True)
+            question = (msg.get("caption") or "").strip() or "Перескажи кратко содержание этого документа."
+            answer = zai_file_qa(path, name, question)
+        else:
+            question = (msg.get("caption") or "").strip() or "Кратко: о чём документ? Основные пункты."
+            doc_text = text[:15000]
+            answer = glm_call(TEXT_MODEL, [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": f"Документ «{name}»:\n\n{doc_text}\n\nВопрос: {question}"}])
+            answer = answer[:3000]
+        hist.append({"role": "user", "content": redact(f"[документ: {name}] {question}")})
+        hist.append({"role": "assistant", "content": redact(answer[:500])})
+        del hist[:-HISTORY_LIMIT]
+        save_state()
+        send_message(chat_id, answer)
+    except Exception as e:
+        send_message(chat_id, f"⚠️ Не смог обработать файл: {e}")
+    print(f"document done chat {chat_id}", flush=True)
+
+
+# ---------- веб-поиск ----------
+def web_search(query, max_results=6):
+    q = urllib.parse.quote(query)
+    req = urllib.request.Request(
+        f"https://lite.duckduckgo.com/lite/?q={q}",
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        h = r.read().decode("utf-8", errors="ignore")
+    links = re.findall(r"<a[^>]*?href=\"([^\"]+)\"[^>]*?class='result-link'>(.*?)</a>", h)
+    snippets = re.findall(r"class='result-snippet'>(.*?)</td>", h, re.S)
+    out = []
+    for i, (href, title) in enumerate(links[:max_results]):
+        m = re.search(r"uddg=([^&]+)", href)
+        url = urllib.parse.unquote(m.group(1)) if m else href
+        title = html_mod.unescape(re.sub(r"<[^>]+>", "", title)).strip()
+        snip = html_mod.unescape(re.sub(r"<[^>]+>", "", snippets[i])).strip() if i < len(snippets) else ""
+        out.append(f"{i + 1}. {title}\n{url}\n{snip[:200]}")
+    return "\n\n".join(out)
+
+
+def handle_search(chat_id, hist, query):
+    send_message(chat_id, f"🔎 Ищу: {query}")
+    try:
+        results = web_search(query)
+    except Exception as e:
+        send_message(chat_id, f"⚠️ Поиск не удался: {e}")
+        return
+    if not results:
+        send_message(chat_id, "Ничего не нашёл. Попробуй переформулировать.")
+        return
+    answer = glm_call(TEXT_MODEL, [
+        {"role": "system", "content": SYSTEM_PROMPT + " Отвечая, ссылайся на источники в формате [1], [2]."},
+        {"role": "user", "content": f"Вопрос: {query}\n\nРезультаты поиска:\n{results[:6000]}\n\n"
+                                    "Дай краткий ответ по этим результатам и перечисли источники."}])
+    hist.append({"role": "user", "content": redact(f"[поиск] {query}")})
+    hist.append({"role": "assistant", "content": redact(answer[:500])})
+    del hist[:-HISTORY_LIMIT]
+    save_state()
+    send_message(chat_id, answer[:4000])
+    print(f"search done chat {chat_id}", flush=True)
+
+
 def download_photo(file_id):
     info = tg_call("getFile", {"file_id": file_id})
     path = info["result"]["file_path"]
@@ -222,7 +371,24 @@ def handle_message(msg):
         return
 
     if text.startswith("/start"):
-        send_message(chat_id, "Привет! Я Борис 🤖 Текст, фото — всё пойму, и помню всё.")
+        send_message(chat_id, "Привет! Я Борис 🤖 Текст, фото, документы, поиск — всё умею, и помню всё.")
+        return
+    if text.startswith("/help"):
+        send_message(chat_id,
+            "Что я умею:\n"
+            "• Просто пишите — отвечу (помню контекст 25 сообщений + факты о вас)\n"
+            "• 📷 Фото — пришлю, опишу или отвечу на вопрос по нему (можно с подписью)\n"
+            "• 📄 Документ — PDF/Word/PowerPoint/Excel/txt и др. + подпись-вопрос\n"
+            "• 🔎 /search <запрос> — поищу в интернете, отвечу со ссылками\n"
+            "• /id — мой Telegram id, /list — доверенные\n"
+            "• /facts — что я о тебе помню, /clear — очистить память чата")
+        return
+    if text.startswith("/search"):
+        query = text[len("/search"):].strip()
+        if not query:
+            send_message(chat_id, "Формат: /search что найти")
+            return
+        handle_search(chat_id, histories.setdefault(chat_id, []), query)
         return
     if text.startswith("/allow"):
         if user_id != OWNER_ID:
@@ -274,6 +440,11 @@ def handle_message(msg):
         else:
             f = facts.get(chat_id)
             send_message(chat_id, f"Долговременная память чата {chat_id}:\n\n{f or '(пока пусто)'}")
+        return
+
+    doc = msg.get("document")
+    if doc:
+        handle_document(msg, chat_id, histories.setdefault(chat_id, []))
         return
 
     photo = (msg.get("photo") or [None])[-1]
@@ -335,6 +506,8 @@ def main():
     try:
         tg_call("setMyCommands", {"commands": [
             {"command": "start", "description": "Приветствие"},
+            {"command": "help", "description": "Что я умею"},
+            {"command": "search", "description": "Поиск в интернете: /search запрос"},
             {"command": "id", "description": "Показать свой Telegram id"},
             {"command": "list", "description": "Список доверенных людей"},
             {"command": "allow", "description": "(хозяин) добавить доверенного: /allow <id>"},
