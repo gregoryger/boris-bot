@@ -47,7 +47,7 @@ TRUSTED_FILE = "trusted.json"
 
 TG = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 ZAI_URL = "https://api.z.ai/api/paas/v4/chat/completions"
-TEXT_MODEL = "glm-5.3"
+TEXT_MODEL = "glm-5.3-flash"   # дешёвая и быстрая; умница glm-5.3 — если вернете
 VISION_MODEL = "glm-4.6v"
 HISTORY_LIMIT = 25          # рабочая память диалога
 FACTS_EVERY = 8             # раз в сколько новых сообщений обновлять факты
