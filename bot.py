@@ -13,6 +13,7 @@
 import base64
 import html as html_mod
 import json
+import mimetypes
 import os
 import re
 import subprocess
@@ -57,9 +58,11 @@ SYSTEM_PROMPT = (
     "Ты — Борис, дружелюбный и полезный ассистент в Telegram твоего хозяина. "
     "Отвечай на языке пользователя, чаще по-русски. Пиши кратко и по делу, "
     "без лишних извинений и воды. Ты не можешь выполнять код и запускать программы — "
-    "никогда не притворяйся, что сделал это. Если пользователь просит подготовить документ (docx), "
-    "выдай его содержимое в блоке ```doc: первая строка — заголовок документа, дальше абзацы обычным текстом, "
-    "строка с '# ' — подзаголовок, '- ' — пункт списка. Вне этого блока напиши 1-2 предложения о документе. "
+    "никогда не притворяйся, что сделал это. Если пользователь просит подготовить файл, "
+    "выдай его содержимое в блоке: ```doc — для Word, ```pdf — для PDF, ```ppt — для презентации. "
+    "Внутри блока: первая строка — общий заголовок; строка с '# ' — подзаголовок "
+    "(в ppt начинает НОВЫЙ СЛАЙД); '- ' — пункт списка; остальное — обычный текст. "
+    "Таблиц не поддерживаю — представляй их списками. Вне блока напиши 1-2 предложения о файле. "
     "Во всех остальных случаях, если чего-то не можешь — честно скажи."
 )
 
@@ -328,14 +331,86 @@ def build_docx(content):
     return path
 
 
+def build_pdf(content):
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.platypus import SimpleDocTemplate, Paragraph
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    reg = next((c for c in ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                            "C:\\Windows\\Fonts\\arial.ttf", "/System/Library/Fonts/Supplemental/Arial.ttf"]
+                if os.path.exists(c)), None)
+    bold = next((c for c in ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                             "C:\\Windows\\Fonts\\arialbd.ttf", "/System/Library/Fonts/Supplemental/Arial Bold.ttf"]
+                 if os.path.exists(c)), reg)
+    if not reg:
+        raise RuntimeError("Не нашёл шрифт с кириллицей для PDF")
+    pdfmetrics.registerFont(TTFont("DV", reg))
+    pdfmetrics.registerFont(TTFont("DV-B", bold))
+    st_title = ParagraphStyle("t", fontName="DV-B", fontSize=18, leading=24, spaceAfter=14)
+    st_h = ParagraphStyle("h", fontName="DV-B", fontSize=14, leading=19, spaceBefore=10, spaceAfter=6)
+    st_p = ParagraphStyle("p", fontName="DV", fontSize=11, leading=16)
+    st_b = ParagraphStyle("b", parent=st_p, leftIndent=16)
+
+    lines = [l.strip() for l in content.splitlines() if l.strip()]
+    if not lines:
+        return None
+    path = "/tmp/boris_doc.pdf"
+    doc = SimpleDocTemplate(path, pagesize=A4, title=lines[0].lstrip("# ")[:80])
+    story = [Paragraph(html_mod.escape(lines[0].lstrip("# ") or "Документ"), st_title)]
+    for l in lines[1:]:
+        if l.startswith("#"):
+            story.append(Paragraph(html_mod.escape(l.lstrip("# ")), st_h))
+        elif l.startswith(("- ", "* ", "• ")):
+            story.append(Paragraph("• " + html_mod.escape(l.lstrip("-*• ")), st_b))
+        elif re.match(r"^\d+[\.\)]\s", l):
+            story.append(Paragraph(html_mod.escape(re.sub(r"^\d+[\.\)]\s", "", l)), st_b))
+        else:
+            story.append(Paragraph(html_mod.escape(l), st_p))
+    doc.build(story)
+    return path
+
+
+def build_pptx(content):
+    from pptx import Presentation
+    prs = Presentation()
+    lines = [l.strip() for l in content.splitlines() if l.strip()]
+    if not lines:
+        return None
+    if not lines[0].startswith("#"):
+        lines[0] = "# " + lines[0]
+    slide = None
+    tf = None
+    first_in_slide = True
+    for l in lines:
+        if l.startswith("#"):
+            slide = prs.slides.add_slide(prs.slide_layouts[1])
+            slide.shapes.title.text = l.lstrip("# ").strip()
+            tf = slide.placeholders[1].text_frame
+            tf.clear()
+            tf.word_wrap = True
+            first_in_slide = True
+        elif slide is None:
+            continue
+        elif first_in_slide:
+            tf.text = l.lstrip("-*• ")
+            first_in_slide = False
+        else:
+            tf.add_paragraph().text = l.lstrip("-*• ")
+    path = "/tmp/boris_doc.pptx"
+    prs.save(path)
+    return path
+
+
 def send_document(chat_id, path, filename):
+    mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     boundary = "----borisdoc987654321"
     with open(path, "rb") as f:
         data = f.read()
     body = (
         f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n"
         f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{filename}\"\r\n"
-        f"Content-Type: application/vnd.openxmlformats-officedocument.wordprocessingml.document\r\n\r\n"
+        f"Content-Type: {mime}\r\n\r\n"
     ).encode("utf-8") + data + f"\r\n--{boundary}--\r\n".encode("utf-8")
     req = urllib.request.Request(
         TG + "/sendDocument", data=body, method="POST",
@@ -517,14 +592,17 @@ def handle_message(msg):
             answer = answer[:500]
         else:
             answer = glm_call(TEXT_MODEL, [build_system(chat_id)] + hist)
-            doc_block = re.search(r"```doc\s*\n(.*?)```", answer, re.S)
-            if doc_block:
-                answer = (answer[:doc_block.start()] + answer[doc_block.end():]).strip()
+            doc_m = re.search(r"```(doc|pdf|ppt)\s*\n(.*?)```", answer, re.S)
+            if doc_m:
+                kind, content = doc_m.group(1), doc_m.group(2).strip()
+                answer = (answer[:doc_m.start()] + answer[doc_m.end():]).strip()
                 try:
-                    path = build_docx(doc_block.group(1))
+                    fname = {"doc": "boris.docx", "pdf": "boris.pdf", "ppt": "boris.pptx"}[kind]
+                    builder = {"doc": build_docx, "pdf": build_pdf, "ppt": build_pptx}[kind]
+                    path = builder(content)
                     if path:
-                        send_document(chat_id, path, "boris.docx")
-                        answer = (answer + "\n\n📎 Файл boris.docx отправил!").strip()
+                        send_document(chat_id, path, fname)
+                        answer = (answer + f"\n\n📎 Файл {fname} отправил!").strip()
                 except Exception as e:
                     answer = (answer + f"\n\n⚠️ Не смог собрать файл: {e}").strip()
     except Exception as e:
