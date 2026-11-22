@@ -40,8 +40,8 @@ def redact(s):
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ZAI_API_KEY = os.environ["ZAI_API_KEY"]
 
-OWNER_ID = 1033935384  # Григорий (gregoryger1)
-ALLOWED = {OWNER_ID}
+OWNER_ID = 1033935384  # Григорий (gregoryger1) — запасной, если owners.json нет
+OWNERS_FILE = "owners.json"
 MEMORY_FILE = "memory.json"
 FACTS_FILE = "facts.json"
 TRUSTED_FILE = "trusted.json"
@@ -69,6 +69,7 @@ SYSTEM_PROMPT = (
 histories = {}  # chat_id -> [{"role":..., "content":...}]
 facts = {}      # chat_id -> "строка фактов"
 trusted = set()  # доп. доверенные id
+owners = {OWNER_ID}  # хозяева (загружается из owners.json)
 since_facts = {}  # chat_id -> счётчик сообщений с последнего обновления фактов
 
 
@@ -101,11 +102,12 @@ def _save_json(name, obj):
 
 
 def load_state():
-    global histories, facts, trusted
+    global histories, facts, trusted, owners
     histories = {int(k): v for k, v in _load_json(MEMORY_FILE, {}).items()}
     facts = {int(k): v for k, v in _load_json(FACTS_FILE, {}).items()}
     trusted = set(_load_json(TRUSTED_FILE, []))
-    print(f"Состояние загружено: чатов={len(histories)}, фактов у {len(facts)} чатов, доверенных={len(trusted)}", flush=True)
+    owners = {OWNER_ID} | set(_load_json(OWNERS_FILE, []))
+    print(f"Состояние загружено: чатов={len(histories)}, фактов у {len(facts)} чатов, доверенных={len(trusted)}, хозяев={len(owners)}", flush=True)
 
 
 def save_state():
@@ -113,6 +115,7 @@ def save_state():
         _save_json(MEMORY_FILE, {str(k): v for k, v in histories.items()})
         _save_json(FACTS_FILE, {str(k): v for k, v in facts.items()})
         _save_json(TRUSTED_FILE, sorted(trusted))
+        _save_json(OWNERS_FILE, sorted(owners))
     except Exception as e:
         print("Не смог записать состояние:", e, flush=True)
         return
@@ -120,23 +123,25 @@ def save_state():
 
 
 def is_allowed(user_id):
-    return user_id == OWNER_ID or user_id in trusted
+    return user_id in owners or user_id in trusted
 
 
 def refresh_external_state():
-    """Подтягивает факты/доверенных, залитые с других устройств (git pull)."""
+    """Подтягивает факты/доверенных/хозяев, залитые с других устройств (git pull)."""
     try:
-        m0 = os.path.getmtime(FACTS_FILE) if os.path.exists(FACTS_FILE) else 0
+        watched = [FACTS_FILE, TRUSTED_FILE, OWNERS_FILE]
+        m0 = [os.path.getmtime(f) if os.path.exists(f) else 0 for f in watched]
         r = subprocess.run(["git", "pull", "--rebase", "origin", "main"],
                            capture_output=True, text=True)
         if r.returncode != 0:
             print("git pull:", (r.stderr or r.stdout).strip()[:120], flush=True)
             return
-        m1 = os.path.getmtime(FACTS_FILE) if os.path.exists(FACTS_FILE) else 0
+        m1 = [os.path.getmtime(f) if os.path.exists(f) else 0 for f in watched]
         if m1 != m0:
-            global facts, trusted
+            global facts, trusted, owners
             facts = {int(k): v for k, v in _load_json(FACTS_FILE, {}).items()}
             trusted = set(_load_json(TRUSTED_FILE, []))
+            owners = {OWNER_ID} | set(_load_json(OWNERS_FILE, []))
             print("Память обновлена из репозитория (синхронизация с устройствами)", flush=True)
     except Exception as e:
         print("refresh не удался:", e, flush=True)
@@ -508,7 +513,7 @@ def handle_message(msg):
         handle_search(chat_id, histories.setdefault(chat_id, []), query)
         return
     if text.startswith("/allow"):
-        if user_id != OWNER_ID:
+        if user_id not in owners:
             send_message(chat_id, "⛔ Добавлять людей может только хозяин.")
             return
         try:
@@ -516,15 +521,15 @@ def handle_message(msg):
         except (IndexError, ValueError):
             send_message(chat_id, "Формат: /allow <id>. Пусть человек напишет боту /id и пришлёт тебе его id.")
             return
-        if new_id == OWNER_ID:
-            send_message(chat_id, "Это ты сам 🙂")
+        if new_id in owners:
+            send_message(chat_id, "Этот человек уже хозяин 🙂")
             return
         trusted.add(new_id)
         save_state()
         send_message(chat_id, f"✅ Добавил {new_id} в доверенные.")
         return
     if text.startswith("/disallow"):
-        if user_id != OWNER_ID:
+        if user_id not in owners:
             send_message(chat_id, "⛔ Только хозяин.")
             return
         try:
@@ -537,8 +542,9 @@ def handle_message(msg):
         send_message(chat_id, f"Убрал {rm_id} из доверенных.")
         return
     if text.startswith("/list"):
-        ids = [OWNER_ID] + sorted(trusted)
-        send_message(chat_id, "Доверенные:\n" + "\n".join(str(i) for i in ids))
+        lines = ["👑 Хозяева:"] + [str(i) for i in sorted(owners)]
+        lines += ["", "🙂 Доверенные:"] + ([str(i) for i in sorted(trusted)] or ["(пусто)"])
+        send_message(chat_id, "\n".join(lines))
         return
     if text.startswith("/clear"):
         histories.pop(chat_id, None)
@@ -547,7 +553,7 @@ def handle_message(msg):
         send_message(chat_id, "Рабочая память этого чата очищена (факты остались; убрать их: /facts clear).")
         return
     if text.startswith("/facts"):
-        if user_id != OWNER_ID:
+        if user_id not in owners:
             send_message(chat_id, "⛔ Только хозяин.")
             return
         if text.strip() == "/facts clear":
@@ -627,7 +633,7 @@ def main():
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
-    print("Борис запущен. Хозяин:", OWNER_ID, flush=True)
+    print("Борис запущен. Хозяева:", sorted(owners), flush=True)
 
     load_state()
     tg_call("deleteWebhook", {"drop_pending_updates": False})
